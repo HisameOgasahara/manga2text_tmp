@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import re
 import shutil
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -20,15 +22,27 @@ CLASS_NAMES = {
     3: "panel",
 }
 
-SUPPORTED_IMAGE_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+PADDLE_LANG_BY_SOURCE = {
+    "ko": "korean",
+    "ja": "japan",
+    "zh": "ch",
+    "en": "en",
+}
+
+LANGUAGE_NAMES = {
+    "ko": "한국어",
+    "ja": "일본어",
+    "zh": "중국어",
+    "en": "영어",
+    "unknown": "알 수 없음",
 }
 
 HANGUL_RE = re.compile(r"[\uac00-\ud7a3]")
 KANA_RE = re.compile(r"[\u3040-\u30ff]")
+CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+LATIN_RE = re.compile(r"[A-Za-z]")
 
 
 # -----------------------------------------------------------------------------
@@ -36,7 +50,6 @@ KANA_RE = re.compile(r"[\u3040-\u30ff]")
 # -----------------------------------------------------------------------------
 
 def classify_inputs(input_dir: Path) -> dict[str, list[Path]]:
-    """Classify uploaded files into images, PDFs, and unsupported files."""
     groups = {
         "images": [],
         "pdfs": [],
@@ -62,16 +75,12 @@ def describe_input_mode(groups: dict[str, list[Path]]) -> str:
 
     if image_count == 1 and pdf_count == 0:
         return "단일 이미지"
-
     if image_count > 1 and pdf_count == 0:
         return "여러 이미지"
-
     if image_count == 0 and pdf_count == 1:
         return "PDF"
-
     if image_count == 0 and pdf_count > 1:
         return "여러 PDF"
-
     if image_count > 0 and pdf_count > 0:
         return "이미지 + PDF 혼합"
 
@@ -84,7 +93,6 @@ def make_preview_images(
     pdf_preview_pages: int = 3,
     pdf_dpi: int = 90,
 ) -> list[tuple[str, Image.Image]]:
-    """Create lightweight thumbnails for uploaded images and PDFs."""
     import fitz
 
     groups = classify_inputs(input_dir)
@@ -95,12 +103,7 @@ def make_preview_images(
             break
 
         with Image.open(image_path) as image:
-            previews.append(
-                (
-                    image_path.name,
-                    image.convert("RGB").copy(),
-                )
-            )
+            previews.append((image_path.name, image.convert("RGB").copy()))
 
     for pdf_path in groups["pdfs"]:
         if len(previews) >= max_items:
@@ -113,21 +116,17 @@ def make_preview_images(
             max_items - len(previews),
         )
 
-        zoom = pdf_dpi / 72.0
-        matrix = fitz.Matrix(zoom, zoom)
+        matrix = fitz.Matrix(pdf_dpi / 72.0, pdf_dpi / 72.0)
 
         for page_index in range(preview_count):
             page = document[page_index]
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-
             image = Image.frombytes(
                 "RGB",
                 (pixmap.width, pixmap.height),
                 pixmap.samples,
             )
-
-            label = f"{pdf_path.name} / p.{page_index + 1}"
-            previews.append((label, image))
+            previews.append((f"{pdf_path.name} / p.{page_index + 1}", image))
 
         document.close()
 
@@ -144,14 +143,11 @@ def _render_pdf_page(
     page_index: int,
     dpi: int,
 ) -> Path:
-    """Render one PDF page. Each worker opens its own document for thread safety."""
     import fitz
 
     document = fitz.open(pdf_path)
     page = document[page_index]
-
-    zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
+    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     pixmap = page.get_pixmap(matrix=matrix, alpha=False)
 
     image = Image.frombytes(
@@ -160,12 +156,10 @@ def _render_pdf_page(
         pixmap.samples,
     )
 
-    output_path = output_dir / (
-        f"{pdf_path.stem}_page_{page_index + 1:04d}.png"
-    )
+    output_path = output_dir / f"{pdf_path.stem}_page_{page_index + 1:04d}.png"
     image.save(output_path)
-
     document.close()
+
     return output_path
 
 
@@ -176,7 +170,6 @@ def pdf_to_images(
     page_limit: int | None = None,
     workers: int = 4,
 ) -> list[Path]:
-    """Render PDF pages in parallel using independent PyMuPDF documents."""
     import fitz
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -192,12 +185,7 @@ def pdf_to_images(
 
     if workers <= 1:
         return [
-            _render_pdf_page(
-                pdf_path=pdf_path,
-                output_dir=output_dir,
-                page_index=page_index,
-                dpi=dpi,
-            )
+            _render_pdf_page(pdf_path, output_dir, page_index, dpi)
             for page_index in page_indices
         ]
 
@@ -212,11 +200,7 @@ def pdf_to_images(
             )
             for page_index in page_indices
         ]
-
-        output_paths = [
-            future.result()
-            for future in futures
-        ]
+        output_paths = [future.result() for future in futures]
 
     return sorted(output_paths)
 
@@ -234,19 +218,15 @@ def collect_page_images(
     page_limit: int | None = None,
     workers: int = 4,
 ) -> list[Path]:
-    """Prepare images from mixed image/PDF uploads."""
     page_dir.mkdir(parents=True, exist_ok=True)
     groups = classify_inputs(input_dir)
-
     page_paths: list[Path] = []
 
     image_paths = groups["images"]
+
     if image_paths:
         if workers <= 1:
-            copied = [
-                _copy_image(path, page_dir)
-                for path in image_paths
-            ]
+            copied = [_copy_image(path, page_dir) for path in image_paths]
         else:
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 copied = list(
@@ -259,16 +239,13 @@ def collect_page_images(
         page_paths.extend(copied)
 
     for pdf_path in groups["pdfs"]:
-        pdf_output_dir = page_dir / pdf_path.stem
-
         converted = pdf_to_images(
             pdf_path=pdf_path,
-            output_dir=pdf_output_dir,
+            output_dir=page_dir / pdf_path.stem,
             dpi=pdf_dpi,
             page_limit=page_limit,
             workers=workers,
         )
-
         page_paths.extend(converted)
 
     return sorted(page_paths, key=lambda path: str(path).lower())
@@ -283,15 +260,19 @@ def load_koharu_detector(
 ):
     from huggingface_hub import hf_hub_download
 
+    print(f"[Detector] Hugging Face: {repo_id}")
+
     weights_path = hf_hub_download(
         repo_id=repo_id,
         filename="model.safetensors",
     )
-
     loader_path = hf_hub_download(
         repo_id=repo_id,
         filename="load_model.py",
     )
+
+    print(f"[Detector] weights: {weights_path}")
+    print(f"[Detector] loader : {loader_path}")
 
     spec = importlib.util.spec_from_file_location(
         "koharu_layout_loader",
@@ -304,8 +285,7 @@ def load_koharu_detector(
     loader = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loader)
 
-    detector = loader.load_model(weights_path)
-    return detector
+    return loader.load_model(weights_path)
 
 
 def detect_regions(
@@ -332,8 +312,7 @@ def detect_regions(
         class_id = int(class_id)
         score = float(score)
 
-        required_score = class_thresholds[class_id]
-        if score < required_score:
+        if score < class_thresholds[class_id]:
             continue
 
         if class_id == 0:
@@ -343,10 +322,7 @@ def detect_regions(
         else:
             continue
 
-        x1, y1, x2, y2 = [
-            int(round(value))
-            for value in box
-        ]
+        x1, y1, x2, y2 = [int(round(value)) for value in box]
 
         regions.append(
             {
@@ -385,21 +361,14 @@ def sort_regions_reading_order(
 
     def center(region: dict[str, Any]) -> tuple[float, float]:
         x1, y1, x2, y2 = region["bbox"]
-        return (
-            (x1 + x2) / 2,
-            (y1 + y2) / 2,
-        )
+        return ((x1 + x2) / 2, (y1 + y2) / 2)
 
     remaining = list(regions)
     ordered: list[dict[str, Any]] = []
 
     while remaining:
-        remaining.sort(
-            key=lambda region: center(region)[1]
-        )
-
-        anchor = remaining[0]
-        _, anchor_y = center(anchor)
+        remaining.sort(key=lambda region: center(region)[1])
+        anchor_y = center(remaining[0])[1]
 
         same_row = [
             region
@@ -413,12 +382,7 @@ def sort_regions_reading_order(
         )
 
         ordered.extend(same_row)
-
-        same_row_ids = {
-            id(region)
-            for region in same_row
-        }
-
+        same_row_ids = {id(region) for region in same_row}
         remaining = [
             region
             for region in remaining
@@ -437,13 +401,18 @@ def load_ocr_backend(
     paddle_lang: str = "korean",
     paddle_device: str = "cpu",
 ):
+    print(
+        f"[OCR] backend={backend}, "
+        f"paddle_lang={paddle_lang}, "
+        f"device={paddle_device}"
+    )
+
     if backend == "manga":
         from manga_ocr import MangaOcr
         return MangaOcr()
 
     if backend == "paddle":
         from paddleocr import PaddleOCR
-
         return PaddleOCR(
             lang=paddle_lang,
             device=paddle_device,
@@ -452,9 +421,7 @@ def load_ocr_backend(
             use_textline_orientation=False,
         )
 
-    raise ValueError(
-        'OCR backend은 "manga" 또는 "paddle"이어야 합니다.'
-    )
+    raise ValueError('OCR backend은 "manga" 또는 "paddle"이어야 합니다.')
 
 
 def run_manga_ocr(model, crop: Image.Image) -> str:
@@ -471,10 +438,9 @@ def run_paddle_ocr(model, crop: Image.Image) -> str:
         if "res" in data:
             data = data["res"]
 
-        texts = data.get("rec_texts", [])
-
-        for text in texts:
+        for text in data.get("rec_texts", []):
             text = str(text).strip()
+
             if text:
                 recognized_texts.append(text)
 
@@ -496,7 +462,182 @@ def run_ocr(
 
 
 # -----------------------------------------------------------------------------
-# 5. Language detection
+# 5. Source-language routing
+# -----------------------------------------------------------------------------
+
+def resolve_ocr_configuration(
+    source_language: str,
+    ocr_backend: str = "auto",
+    reading_direction: str = "auto",
+) -> dict[str, str]:
+    if source_language not in PADDLE_LANG_BY_SOURCE:
+        raise ValueError(f"지원하지 않는 언어: {source_language}")
+
+    if ocr_backend == "auto":
+        resolved_backend = "manga" if source_language == "ja" else "paddle"
+    else:
+        resolved_backend = ocr_backend
+
+    if reading_direction == "auto":
+        resolved_direction = "rtl" if source_language == "ja" else "ltr"
+    else:
+        resolved_direction = reading_direction
+
+    return {
+        "source_language": source_language,
+        "ocr_backend": resolved_backend,
+        "paddle_lang": PADDLE_LANG_BY_SOURCE[source_language],
+        "reading_direction": resolved_direction,
+    }
+
+
+def _script_score(text: str, language: str) -> float:
+    visible = [char for char in text if not char.isspace()]
+
+    if not visible:
+        return 0.0
+
+    hangul = len(HANGUL_RE.findall(text))
+    kana = len(KANA_RE.findall(text))
+    cjk = len(CJK_RE.findall(text))
+    latin = len(LATIN_RE.findall(text))
+    length = len(visible)
+
+    if language == "ko":
+        raw = 3.0 * hangul + 0.25 * latin - 1.0 * kana
+    elif language == "ja":
+        raw = 3.0 * kana + 0.8 * cjk - 1.0 * hangul
+    elif language == "zh":
+        raw = 2.0 * cjk - 2.0 * kana - 1.0 * hangul
+    elif language == "en":
+        raw = 2.0 * latin - 0.5 * hangul - 0.5 * kana
+    else:
+        return 0.0
+
+    return max(0.0, raw / length) * math.log1p(length)
+
+
+def _sample_text_regions(
+    page_paths: list[Path],
+    detector,
+    class_thresholds: dict[int, float],
+    crop_padding: int,
+    max_crops: int,
+) -> list[Image.Image]:
+    crops: list[Image.Image] = []
+
+    for page_path in page_paths[:3]:
+        image = Image.open(page_path).convert("RGB")
+        regions = detect_regions(
+            detector=detector,
+            image=image,
+            class_thresholds=class_thresholds,
+            include_sfx=False,
+        )
+        regions = sorted(
+            regions,
+            key=lambda region: region["score"],
+            reverse=True,
+        )
+
+        for region in regions:
+            crops.append(
+                crop_region(
+                    image=image,
+                    bbox=region["bbox"],
+                    padding=crop_padding,
+                )
+            )
+
+            if len(crops) >= max_crops:
+                return crops
+
+    return crops
+
+
+def auto_detect_source_language(
+    page_paths: list[Path],
+    detector,
+    class_thresholds: dict[int, float],
+    crop_padding: int = 8,
+    max_crops: int = 3,
+    paddle_device: str = "cpu",
+) -> tuple[str, dict[str, Any]]:
+    print("[Auto language] 첫 텍스트 영역을 여러 OCR 후보로 시험합니다.")
+
+    crops = _sample_text_regions(
+        page_paths=page_paths,
+        detector=detector,
+        class_thresholds=class_thresholds,
+        crop_padding=crop_padding,
+        max_crops=max_crops,
+    )
+
+    if not crops:
+        raise RuntimeError("자동 언어 판별용 텍스트 영역을 찾지 못했습니다.")
+
+    candidates = {
+        "ko": ("paddle", "korean"),
+        "ja": ("manga", "japan"),
+        "zh": ("paddle", "ch"),
+        "en": ("paddle", "en"),
+    }
+
+    results: dict[str, Any] = {}
+
+    for language, (backend, paddle_lang) in candidates.items():
+        print(f"[Auto language] testing {language} / {backend}")
+
+        model = load_ocr_backend(
+            backend=backend,
+            paddle_lang=paddle_lang,
+            paddle_device=paddle_device,
+        )
+
+        texts = []
+
+        for crop in crops:
+            text = run_ocr(
+                backend=backend,
+                model=model,
+                crop=crop,
+            ).strip()
+
+            if text:
+                texts.append(text)
+
+        joined = "\n".join(texts)
+        score = _script_score(joined, language)
+
+        results[language] = {
+            "backend": backend,
+            "paddle_lang": paddle_lang,
+            "score": score,
+            "sample": joined[:240],
+        }
+
+        print(f"  score={score:.3f} | sample={joined[:100]!r}")
+
+        del model
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    selected_language = max(
+        results,
+        key=lambda language: results[language]["score"],
+    )
+
+    print(
+        "[Auto language] selected: "
+        f"{selected_language} ({LANGUAGE_NAMES[selected_language]})"
+    )
+
+    return selected_language, results
+
+
+# -----------------------------------------------------------------------------
+# 6. Language detection after OCR
 # -----------------------------------------------------------------------------
 
 def build_language_detector():
@@ -528,10 +669,8 @@ def detect_language(
 
     if not text:
         return "unknown"
-
     if HANGUL_RE.search(text):
         return "ko"
-
     if KANA_RE.search(text):
         return "ja"
 
@@ -544,17 +683,15 @@ def detect_language(
 
 
 # -----------------------------------------------------------------------------
-# 6. Small local translation LLM
+# 7. Small local translation LLM
 # -----------------------------------------------------------------------------
 
 def load_translation_model(
     model_name: str = "Qwen/Qwen3-1.7B",
 ):
-    from transformers import (
-        AutoModelForCausalLM,
-        AutoTokenizer,
-        BitsAndBytesConfig,
-    )
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    print(f"[Translation] loading {model_name} in 4-bit")
 
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -564,15 +701,14 @@ def load_translation_model(
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",
         torch_dtype=torch.float16,
         quantization_config=quantization_config,
     )
-
     model.eval()
+
     return tokenizer, model
 
 
@@ -595,10 +731,7 @@ def translate_to_korean(
     if source_language == "ko":
         return text
 
-    source_name = SOURCE_LANGUAGE_NAMES.get(
-        source_language,
-        "외국어",
-    )
+    source_name = SOURCE_LANGUAGE_NAMES.get(source_language, "외국어")
 
     messages = [
         {
@@ -625,10 +758,7 @@ def translate_to_korean(
         enable_thinking=False,
     )
 
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-    ).to(model.device)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
     generated = model.generate(
         **inputs,
@@ -636,21 +766,13 @@ def translate_to_korean(
         do_sample=False,
     )
 
-    new_tokens = generated[
-        0,
-        inputs["input_ids"].shape[1]:,
-    ]
+    new_tokens = generated[0, inputs["input_ids"].shape[1]:]
 
-    translated = tokenizer.decode(
-        new_tokens,
-        skip_special_tokens=True,
-    )
-
-    return translated.strip()
+    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
 # -----------------------------------------------------------------------------
-# 7. Full page pipeline
+# 8. Full pipeline + diagnostics
 # -----------------------------------------------------------------------------
 
 def process_pages(
@@ -669,10 +791,13 @@ def process_pages(
     translation_tokenizer=None,
     translation_model=None,
     max_new_tokens: int = 256,
+    debug: bool = True,
+    debug_samples_per_page: int = 3,
 ) -> list[dict[str, Any]]:
     from tqdm.auto import tqdm
 
     records: list[dict[str, Any]] = []
+    language_counter = Counter()
 
     for page_number, page_path in enumerate(
         tqdm(page_paths, desc="페이지 처리"),
@@ -693,10 +818,14 @@ def process_pages(
             row_tolerance=row_tolerance,
         )
 
-        for region_index, region in enumerate(
-            regions,
-            start=1,
-        ):
+        if debug:
+            print(f"\n[Page {page_number:03d}] {page_path.name}")
+            print(f"  detector regions: {len(regions)}")
+
+        page_ocr_count = 0
+        page_translation_count = 0
+
+        for region_index, region in enumerate(regions, start=1):
             crop = crop_region(
                 image=image,
                 bbox=region["bbox"],
@@ -712,13 +841,19 @@ def process_pages(
             if not original_text:
                 continue
 
+            page_ocr_count += 1
+
             language = detect_language(
                 text=original_text,
                 detector=language_detector,
                 language_to_code=language_to_code,
             )
+            language_counter[language] += 1
 
-            if enable_translation and language != "ko":
+            should_translate = enable_translation and language != "ko"
+
+            if should_translate:
+                page_translation_count += 1
                 translated_text = translate_to_korean(
                     text=original_text,
                     source_language=language,
@@ -728,6 +863,16 @@ def process_pages(
                 )
             else:
                 translated_text = original_text
+
+            if debug and page_ocr_count <= debug_samples_per_page:
+                print(
+                    f"  OCR[{region_index:02d}] "
+                    f"lang={language} translate={should_translate}"
+                )
+                print(f"    original: {original_text[:160]!r}")
+
+                if should_translate:
+                    print(f"    korean  : {translated_text[:160]!r}")
 
             records.append(
                 {
@@ -744,11 +889,20 @@ def process_pages(
                 }
             )
 
+        if debug:
+            print(f"  OCR success: {page_ocr_count}")
+            print(f"  translated : {page_translation_count}")
+
+    print("\n[Pipeline summary]")
+    print(f"  pages          : {len(page_paths)}")
+    print(f"  output records : {len(records)}")
+    print(f"  languages      : {dict(language_counter)}")
+
     return records
 
 
 # -----------------------------------------------------------------------------
-# 8. Save results
+# 9. Save results
 # -----------------------------------------------------------------------------
 
 def save_results(
@@ -762,13 +916,7 @@ def save_results(
 
     with jsonl_path.open("w", encoding="utf-8") as file:
         for record in records:
-            file.write(
-                json.dumps(
-                    record,
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     with txt_path.open("w", encoding="utf-8") as file:
         current_page = None
@@ -776,10 +924,11 @@ def save_results(
         for record in records:
             if record["page"] != current_page:
                 current_page = record["page"]
-                file.write(
-                    f"\n=== Page {current_page} ===\n"
-                )
+                file.write(f"\n=== Page {current_page} ===\n")
 
             file.write(record["korean"] + "\n")
+
+    print(f"[Save] JSONL: {jsonl_path}")
+    print(f"[Save] TXT  : {txt_path}")
 
     return jsonl_path, txt_path
