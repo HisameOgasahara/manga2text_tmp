@@ -4,6 +4,7 @@ import importlib.util
 import json
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -19,54 +20,211 @@ CLASS_NAMES = {
     3: "panel",
 }
 
+SUPPORTED_IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+}
+
 HANGUL_RE = re.compile(r"[\uac00-\ud7a3]")
 KANA_RE = re.compile(r"[\u3040-\u30ff]")
 
 
 # -----------------------------------------------------------------------------
-# 1. PDF / image input
+# 1. Input inspection / preview
 # -----------------------------------------------------------------------------
+
+def classify_inputs(input_dir: Path) -> dict[str, list[Path]]:
+    """Classify uploaded files into images, PDFs, and unsupported files."""
+    groups = {
+        "images": [],
+        "pdfs": [],
+        "unsupported": [],
+    }
+
+    for path in sorted(input_dir.iterdir()):
+        suffix = path.suffix.lower()
+
+        if suffix in SUPPORTED_IMAGE_EXTENSIONS:
+            groups["images"].append(path)
+        elif suffix == ".pdf":
+            groups["pdfs"].append(path)
+        else:
+            groups["unsupported"].append(path)
+
+    return groups
+
+
+def describe_input_mode(groups: dict[str, list[Path]]) -> str:
+    image_count = len(groups["images"])
+    pdf_count = len(groups["pdfs"])
+
+    if image_count == 1 and pdf_count == 0:
+        return "단일 이미지"
+
+    if image_count > 1 and pdf_count == 0:
+        return "여러 이미지"
+
+    if image_count == 0 and pdf_count == 1:
+        return "PDF"
+
+    if image_count == 0 and pdf_count > 1:
+        return "여러 PDF"
+
+    if image_count > 0 and pdf_count > 0:
+        return "이미지 + PDF 혼합"
+
+    return "지원되는 입력 없음"
+
+
+def make_preview_images(
+    input_dir: Path,
+    max_items: int = 8,
+    pdf_preview_pages: int = 3,
+    pdf_dpi: int = 90,
+) -> list[tuple[str, Image.Image]]:
+    """Create lightweight thumbnails for uploaded images and PDFs."""
+    import fitz
+
+    groups = classify_inputs(input_dir)
+    previews: list[tuple[str, Image.Image]] = []
+
+    for image_path in groups["images"]:
+        if len(previews) >= max_items:
+            break
+
+        with Image.open(image_path) as image:
+            previews.append(
+                (
+                    image_path.name,
+                    image.convert("RGB").copy(),
+                )
+            )
+
+    for pdf_path in groups["pdfs"]:
+        if len(previews) >= max_items:
+            break
+
+        document = fitz.open(pdf_path)
+        preview_count = min(
+            len(document),
+            pdf_preview_pages,
+            max_items - len(previews),
+        )
+
+        zoom = pdf_dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+
+        for page_index in range(preview_count):
+            page = document[page_index]
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+
+            image = Image.frombytes(
+                "RGB",
+                (pixmap.width, pixmap.height),
+                pixmap.samples,
+            )
+
+            label = f"{pdf_path.name} / p.{page_index + 1}"
+            previews.append((label, image))
+
+        document.close()
+
+    return previews
+
+
+# -----------------------------------------------------------------------------
+# 2. PDF / image preparation
+# -----------------------------------------------------------------------------
+
+def _render_pdf_page(
+    pdf_path: Path,
+    output_dir: Path,
+    page_index: int,
+    dpi: int,
+) -> Path:
+    """Render one PDF page. Each worker opens its own document for thread safety."""
+    import fitz
+
+    document = fitz.open(pdf_path)
+    page = document[page_index]
+
+    zoom = dpi / 72.0
+    matrix = fitz.Matrix(zoom, zoom)
+    pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+
+    image = Image.frombytes(
+        "RGB",
+        (pixmap.width, pixmap.height),
+        pixmap.samples,
+    )
+
+    output_path = output_dir / (
+        f"{pdf_path.stem}_page_{page_index + 1:04d}.png"
+    )
+    image.save(output_path)
+
+    document.close()
+    return output_path
+
 
 def pdf_to_images(
     pdf_path: Path,
     output_dir: Path,
     dpi: int = 200,
     page_limit: int | None = None,
+    workers: int = 4,
 ) -> list[Path]:
+    """Render PDF pages in parallel using independent PyMuPDF documents."""
     import fitz
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     document = fitz.open(pdf_path)
     page_count = len(document)
+    document.close()
 
     if page_limit is not None:
         page_count = min(page_count, page_limit)
 
-    zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
+    page_indices = list(range(page_count))
 
-    output_paths: list[Path] = []
+    if workers <= 1:
+        return [
+            _render_pdf_page(
+                pdf_path=pdf_path,
+                output_dir=output_dir,
+                page_index=page_index,
+                dpi=dpi,
+            )
+            for page_index in page_indices
+        ]
 
-    for page_index in range(page_count):
-        page = document[page_index]
-        pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                _render_pdf_page,
+                pdf_path,
+                output_dir,
+                page_index,
+                dpi,
+            )
+            for page_index in page_indices
+        ]
 
-        image = Image.frombytes(
-            "RGB",
-            (pixmap.width, pixmap.height),
-            pixmap.samples,
-        )
+        output_paths = [
+            future.result()
+            for future in futures
+        ]
 
-        output_path = output_dir / (
-            f"{pdf_path.stem}_page_{page_index + 1:04d}.png"
-        )
+    return sorted(output_paths)
 
-        image.save(output_path)
-        output_paths.append(output_path)
 
-    document.close()
-    return output_paths
+def _copy_image(input_path: Path, page_dir: Path) -> Path:
+    destination = page_dir / input_path.name
+    shutil.copy2(input_path, destination)
+    return destination
 
 
 def collect_page_images(
@@ -74,42 +232,50 @@ def collect_page_images(
     page_dir: Path,
     pdf_dpi: int = 200,
     page_limit: int | None = None,
+    workers: int = 4,
 ) -> list[Path]:
-    supported_image_extensions = {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".webp",
-    }
-
+    """Prepare images from mixed image/PDF uploads."""
     page_dir.mkdir(parents=True, exist_ok=True)
+    groups = classify_inputs(input_dir)
+
     page_paths: list[Path] = []
 
-    for input_path in sorted(input_dir.iterdir()):
-        suffix = input_path.suffix.lower()
+    image_paths = groups["images"]
+    if image_paths:
+        if workers <= 1:
+            copied = [
+                _copy_image(path, page_dir)
+                for path in image_paths
+            ]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                copied = list(
+                    executor.map(
+                        lambda path: _copy_image(path, page_dir),
+                        image_paths,
+                    )
+                )
 
-        if suffix == ".pdf":
-            pdf_output_dir = page_dir / input_path.stem
+        page_paths.extend(copied)
 
-            converted = pdf_to_images(
-                pdf_path=input_path,
-                output_dir=pdf_output_dir,
-                dpi=pdf_dpi,
-                page_limit=page_limit,
-            )
+    for pdf_path in groups["pdfs"]:
+        pdf_output_dir = page_dir / pdf_path.stem
 
-            page_paths.extend(converted)
+        converted = pdf_to_images(
+            pdf_path=pdf_path,
+            output_dir=pdf_output_dir,
+            dpi=pdf_dpi,
+            page_limit=page_limit,
+            workers=workers,
+        )
 
-        elif suffix in supported_image_extensions:
-            destination = page_dir / input_path.name
-            shutil.copy2(input_path, destination)
-            page_paths.append(destination)
+        page_paths.extend(converted)
 
-    return page_paths
+    return sorted(page_paths, key=lambda path: str(path).lower())
 
 
 # -----------------------------------------------------------------------------
-# 2. Koharu RF-DETR detector
+# 3. Koharu RF-DETR detector
 # -----------------------------------------------------------------------------
 
 def load_koharu_detector(
@@ -167,7 +333,6 @@ def detect_regions(
         score = float(score)
 
         required_score = class_thresholds[class_id]
-
         if score < required_score:
             continue
 
@@ -264,7 +429,7 @@ def sort_regions_reading_order(
 
 
 # -----------------------------------------------------------------------------
-# 3. OCR backends
+# 4. OCR backends
 # -----------------------------------------------------------------------------
 
 def load_ocr_backend(
@@ -310,7 +475,6 @@ def run_paddle_ocr(model, crop: Image.Image) -> str:
 
         for text in texts:
             text = str(text).strip()
-
             if text:
                 recognized_texts.append(text)
 
@@ -332,7 +496,7 @@ def run_ocr(
 
 
 # -----------------------------------------------------------------------------
-# 4. Language detection
+# 5. Language detection
 # -----------------------------------------------------------------------------
 
 def build_language_detector():
@@ -380,7 +544,7 @@ def detect_language(
 
 
 # -----------------------------------------------------------------------------
-# 5. Small local translation LLM
+# 6. Small local translation LLM
 # -----------------------------------------------------------------------------
 
 def load_translation_model(
@@ -399,9 +563,7 @@ def load_translation_model(
         bnb_4bit_use_double_quant=True,
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -488,7 +650,7 @@ def translate_to_korean(
 
 
 # -----------------------------------------------------------------------------
-# 6. Full page pipeline
+# 7. Full page pipeline
 # -----------------------------------------------------------------------------
 
 def process_pages(
@@ -586,7 +748,7 @@ def process_pages(
 
 
 # -----------------------------------------------------------------------------
-# 7. Save results
+# 8. Save results
 # -----------------------------------------------------------------------------
 
 def save_results(
