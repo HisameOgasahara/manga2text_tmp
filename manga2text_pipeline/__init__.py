@@ -6,6 +6,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image
 
 # Load the original single-file implementation under a private module name.
@@ -142,6 +143,31 @@ def _area(bbox: list[int]) -> int:
     return max(0, x2 - x1) * max(0, y2 - y1)
 
 
+def _intersection_area(bbox_a: list[int], bbox_b: list[int]) -> int:
+    ax1, ay1, ax2, ay2 = bbox_a
+    bx1, by1, bx2, by2 = bbox_b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    return max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+
+def _iou(bbox_a: list[int], bbox_b: list[int]) -> float:
+    intersection = _intersection_area(bbox_a, bbox_b)
+    if intersection <= 0:
+        return 0.0
+    union = _area(bbox_a) + _area(bbox_b) - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _containment_ratio(inner_bbox: list[int], outer_bbox: list[int]) -> float:
+    inner_area = _area(inner_bbox)
+    if inner_area <= 0:
+        return 0.0
+    return _intersection_area(inner_bbox, outer_bbox) / inner_area
+
+
 def _center_inside(inner_bbox: list[int], outer_bbox: list[int]) -> bool:
     cx, cy = _center(inner_bbox)
     x1, y1, x2, y2 = outer_bbox
@@ -180,6 +206,83 @@ def _sort_layout_regions(
     )
 
 
+def _coerce_mask(mask: Any) -> np.ndarray | None:
+    if mask is None:
+        return None
+    try:
+        array = np.asarray(mask)
+    except Exception:
+        return None
+    array = np.squeeze(array)
+    if array.ndim != 2 or array.size == 0:
+        return None
+    return array.astype(bool)
+
+
+def _extract_detection_masks(detections) -> list[np.ndarray | None]:
+    raw_masks = getattr(detections, "mask", None)
+    if raw_masks is None:
+        return []
+    try:
+        return [_coerce_mask(mask) for mask in raw_masks]
+    except TypeError:
+        return []
+
+
+def _mask_containment_ratio(
+    text_mask: np.ndarray | None,
+    bubble_mask: np.ndarray | None,
+) -> float:
+    if text_mask is None or bubble_mask is None:
+        return 0.0
+    if text_mask.shape != bubble_mask.shape:
+        return 0.0
+    text_area = int(text_mask.sum())
+    if text_area <= 0:
+        return 0.0
+    intersection = int(np.logical_and(text_mask, bubble_mask).sum())
+    return intersection / text_area
+
+
+def _deduplicate_text_regions(
+    regions: list[dict[str, Any]],
+    iou_threshold: float = 0.78,
+    containment_threshold: float = 0.95,
+) -> list[dict[str, Any]]:
+    """Remove near-duplicate detector regions while preferring the fuller crop."""
+    if not regions:
+        return []
+
+    # Prefer a larger region first so a full sentence/column is retained instead
+    # of a smaller overlapping fragment that would cause clipped duplicate OCR.
+    ordered = sorted(
+        regions,
+        key=lambda region: (
+            -_area(region["bbox"]),
+            -float(region["score"]),
+        ),
+    )
+
+    kept: list[dict[str, Any]] = []
+    for region in ordered:
+        bbox = region["bbox"]
+        duplicate = False
+        for existing in kept:
+            existing_bbox = existing["bbox"]
+            if _iou(bbox, existing_bbox) >= iou_threshold:
+                duplicate = True
+                break
+            # A small region almost completely contained by an already-kept
+            # larger region is normally the same text detected twice.
+            if _containment_ratio(bbox, existing_bbox) >= containment_threshold:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(region)
+
+    return kept
+
+
 def _raw_layout_regions(
     detector,
     image: Image.Image,
@@ -194,14 +297,17 @@ def _raw_layout_regions(
         include_source_image=False,
     )
 
+    detection_masks = _extract_detection_masks(detections)
     text_regions: list[dict[str, Any]] = []
     bubbles: list[dict[str, Any]] = []
     panels: list[dict[str, Any]] = []
 
-    for box, class_id, score in zip(
-        detections.xyxy,
-        detections.class_id,
-        detections.confidence,
+    for detection_index, (box, class_id, score) in enumerate(
+        zip(
+            detections.xyxy,
+            detections.class_id,
+            detections.confidence,
+        )
     ):
         class_id = int(class_id)
         score = float(score)
@@ -214,6 +320,11 @@ def _raw_layout_regions(
             "class_name": CLASS_NAMES[class_id],
             "score": score,
             "bbox": [x1, y1, x2, y2],
+            "mask": (
+                detection_masks[detection_index]
+                if detection_index < len(detection_masks)
+                else None
+            ),
         }
 
         if class_id == 0 or (class_id == 1 and include_sfx):
@@ -241,6 +352,45 @@ def _assign_panel_index(
     return index
 
 
+def _choose_bubble_for_text(
+    text_region: dict[str, Any],
+    bubbles: list[dict[str, Any]],
+) -> int | None:
+    """Assign text to the bubble with the strongest segmentation/spatial overlap."""
+    text_bbox = text_region["bbox"]
+    text_mask = text_region.get("mask")
+    candidates: list[tuple[float, float, float, int]] = []
+
+    for bubble_index, bubble in enumerate(bubbles):
+        bubble_bbox = bubble["bbox"]
+        bbox_overlap = _containment_ratio(text_bbox, bubble_bbox)
+        mask_overlap = _mask_containment_ratio(text_mask, bubble.get("mask"))
+        center_inside = _center_inside(text_bbox, bubble_bbox)
+
+        # Segmentation overlap has priority. If masks are unavailable or do not
+        # share the same raster shape, use a conservative bbox fallback.
+        if mask_overlap > 0:
+            if mask_overlap < 0.20:
+                continue
+        elif bbox_overlap < 0.60 and not center_inside:
+            continue
+
+        candidates.append(
+            (
+                mask_overlap,
+                bbox_overlap,
+                -float(_area(bubble_bbox)),
+                bubble_index,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    return candidates[0][3]
+
+
 def _group_regions_by_bubble(
     text_regions: list[dict[str, Any]],
     bubbles: list[dict[str, Any]],
@@ -256,15 +406,10 @@ def _group_regions_by_bubble(
     standalone: list[dict[str, Any]] = []
 
     for text_region in text_regions:
-        candidates = [
-            (index, bubble)
-            for index, bubble in enumerate(bubbles)
-            if _center_inside(text_region["bbox"], bubble["bbox"])
-        ]
-        if not candidates:
+        bubble_index = _choose_bubble_for_text(text_region, bubbles)
+        if bubble_index is None:
             standalone.append(text_region)
             continue
-        bubble_index, _ = min(candidates, key=lambda item: _area(item[1]["bbox"]))
         assignments[bubble_index].append(text_region)
 
     groups: list[dict[str, Any]] = []
@@ -272,6 +417,10 @@ def _group_regions_by_bubble(
         members = assignments[bubble_index]
         if not members:
             continue
+
+        # Detector may emit both a full-text region and smaller overlapping
+        # fragments for the same bubble. Remove those before OCR.
+        members = _deduplicate_text_regions(members)
         members = _sort_layout_regions(
             members,
             direction=bubble_direction,
@@ -289,6 +438,9 @@ def _group_regions_by_bubble(
             }
         )
 
+    # Deduplicate only within spatially overlapping standalone text. This keeps
+    # captions/narration outside speech bubbles while avoiding obvious repeats.
+    standalone = _deduplicate_text_regions(standalone)
     for text_region in standalone:
         groups.append(
             {
@@ -301,7 +453,7 @@ def _group_regions_by_bubble(
             }
         )
 
-    # First determine panel order. Then sort dialogue groups only inside each panel.
+    # Reading-order logic intentionally unchanged by the grouping patch.
     ordered_panels = _sort_layout_regions(
         panels,
         direction=panel_direction,
@@ -332,7 +484,6 @@ def _group_regions_by_bubble(
             )
         )
 
-    # Items not captured by any panel are kept as a fallback after panel groups.
     if None in buckets:
         ordered_groups.extend(
             _sort_layout_regions(
