@@ -84,41 +84,36 @@ def load_ocr_backend(
 
     _ensure_comic_translate_import_path()
 
-    from modules.ocr.pororo.engine import PororoOCREngine
+    # Import the Pororo core directly. Do not import PororoOCREngine because
+    # that wrapper imports the PPOCR package and pulls in onnxruntime even when
+    # Pororo itself is running with PyTorch.
+    from modules.ocr.pororo.main import PororoOcr
 
     requested_device = pororo_device or (
         "cuda" if torch.cuda.is_available() else "cpu"
     )
 
     if requested_device == "cuda" and not torch.cuda.is_available():
-        print(
-            "[Pororo OCR] PyTorch CUDA를 사용할 수 없습니다. "
-            "CPU로 fallback합니다."
-        )
+        print("[Pororo OCR] CUDA를 사용할 수 없어 CPU로 fallback합니다.")
         requested_device = "cpu"
 
-    print(
-        "[Pororo OCR] backend=PyTorch/BrainOCR, "
-        f"device={requested_device}"
-    )
+    print(f"[Pororo OCR] PyTorch BrainOCR device={requested_device}")
 
-    model = PororoOCREngine()
-    model.initialize(
+    return PororoOcr(
+        model="brainocr",
         lang="ko",
         device=requested_device,
         use_text_lines=False,
     )
-    return model
 
 
 def run_pororo_ocr(model, crop: Image.Image) -> str:
     image_array = np.array(crop.convert("RGB"))
 
-    # PororoOCREngine wraps PororoOcr as `model`.
-    # Koharu already supplies the text crop, so we only need Pororo's
-    # recognition result for this crop; Pororo may internally refine text lines.
-    model.model.run_ocr(image_array)
-    result = model.model.get_ocr_result()
+    # Koharu already supplies the text crop. Pororo is used here only to read
+    # that crop; if it internally splits the crop into lines, join them back.
+    model.run_ocr(image_array)
+    result = model.get_ocr_result()
 
     texts: list[str] = []
     for text in result.get("description", []):
