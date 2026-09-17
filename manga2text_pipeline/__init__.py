@@ -6,13 +6,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-import torch
 from PIL import Image
 
 # Load the original single-file implementation under a private module name.
-# Because this package directory has the same import name as manga2text_pipeline.py,
-# Python imports this package first. We then re-export the original API and override
-# only process_pages with bubble-aware grouping.
 _ORIGINAL_PATH = Path(__file__).resolve().parent.parent / "manga2text_pipeline.py"
 _spec = importlib.util.spec_from_file_location("_manga2text_pipeline_base", _ORIGINAL_PATH)
 if _spec is None or _spec.loader is None:
@@ -24,6 +20,117 @@ for _name in dir(_base):
     if not _name.startswith("_"):
         globals()[_name] = getattr(_base, _name)
 
+
+# -----------------------------------------------------------------------------
+# Reading-order configuration
+# -----------------------------------------------------------------------------
+
+READING_ORDER_PRESETS = {
+    "한국/영문 페이지형": {
+        "panel_direction": "ltr",
+        "bubble_direction": "ltr",
+        "vertical_priority": False,
+    },
+    "일본 원서": {
+        "panel_direction": "rtl",
+        "bubble_direction": "rtl",
+        "vertical_priority": False,
+    },
+    "세로 웹툰": {
+        "panel_direction": "ltr",
+        "bubble_direction": "ltr",
+        "vertical_priority": True,
+    },
+    "일본 만화 번역본(LTR 대사)": {
+        "panel_direction": "rtl",
+        "bubble_direction": "ltr",
+        "vertical_priority": False,
+    },
+}
+
+_READING_ORDER_CONFIG = {
+    "mode": "legacy",
+    "preset": None,
+    "panel_direction": None,
+    "bubble_direction": None,
+    "vertical_priority": False,
+}
+
+
+def set_reading_order_preset(preset: str) -> dict[str, Any]:
+    if preset not in READING_ORDER_PRESETS:
+        raise ValueError(
+            f"알 수 없는 읽기 순서 프리셋: {preset}. "
+            f"가능한 값: {list(READING_ORDER_PRESETS)}"
+        )
+    values = READING_ORDER_PRESETS[preset]
+    _READING_ORDER_CONFIG.update(
+        {
+            "mode": "preset",
+            "preset": preset,
+            **values,
+        }
+    )
+    return get_reading_order_config()
+
+
+def set_reading_order_manual(
+    panel_direction: str,
+    bubble_direction: str,
+    vertical_priority: bool = False,
+) -> dict[str, Any]:
+    for name, value in {
+        "panel_direction": panel_direction,
+        "bubble_direction": bubble_direction,
+    }.items():
+        if value not in {"ltr", "rtl"}:
+            raise ValueError(f"{name}은 'ltr' 또는 'rtl'이어야 합니다.")
+
+    _READING_ORDER_CONFIG.update(
+        {
+            "mode": "manual",
+            "preset": None,
+            "panel_direction": panel_direction,
+            "bubble_direction": bubble_direction,
+            "vertical_priority": bool(vertical_priority),
+        }
+    )
+    return get_reading_order_config()
+
+
+def reset_reading_order_config() -> dict[str, Any]:
+    _READING_ORDER_CONFIG.update(
+        {
+            "mode": "legacy",
+            "preset": None,
+            "panel_direction": None,
+            "bubble_direction": None,
+            "vertical_priority": False,
+        }
+    )
+    return get_reading_order_config()
+
+
+def get_reading_order_config() -> dict[str, Any]:
+    return dict(_READING_ORDER_CONFIG)
+
+
+def _resolved_order_config(legacy_direction: str) -> dict[str, Any]:
+    config = get_reading_order_config()
+    if config["mode"] == "legacy":
+        return {
+            "mode": "legacy",
+            "preset": None,
+            "panel_direction": legacy_direction,
+            "bubble_direction": legacy_direction,
+            "vertical_priority": False,
+        }
+    return config
+
+
+# -----------------------------------------------------------------------------
+# Layout helpers
+# -----------------------------------------------------------------------------
 
 def _center(bbox: list[int]) -> tuple[float, float]:
     x1, y1, x2, y2 = bbox
@@ -42,9 +149,35 @@ def _center_inside(inner_bbox: list[int], outer_bbox: list[int]) -> bool:
 
 
 def _normalize_dialogue(text: str) -> str:
-    # PaddleOCR commonly returns one recognized line per newline. Inside one
-    # speech bubble those line breaks are layout, not separate dialogue records.
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _sort_layout_regions(
+    regions: list[dict[str, Any]],
+    direction: str,
+    row_tolerance: int,
+    vertical_priority: bool = False,
+) -> list[dict[str, Any]]:
+    if not regions:
+        return []
+
+    if vertical_priority:
+        # Webtoon-style: top-to-bottom dominates. Horizontal position is only
+        # a tie-breaker when two items are nearly level.
+        sign = 1 if direction == "ltr" else -1
+        return sorted(
+            regions,
+            key=lambda region: (
+                _center(region["bbox"])[1],
+                sign * _center(region["bbox"])[0],
+            ),
+        )
+
+    return sort_regions_reading_order(
+        regions,
+        direction=direction,
+        row_tolerance=row_tolerance,
+    )
 
 
 def _raw_layout_regions(
@@ -53,7 +186,7 @@ def _raw_layout_regions(
     class_thresholds: dict[int, float],
     include_sfx: bool,
     minimum_threshold: float = 0.20,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     detections = detector.predict(
         image,
         threshold=minimum_threshold,
@@ -63,6 +196,7 @@ def _raw_layout_regions(
 
     text_regions: list[dict[str, Any]] = []
     bubbles: list[dict[str, Any]] = []
+    panels: list[dict[str, Any]] = []
 
     for box, class_id, score in zip(
         detections.xyxy,
@@ -86,19 +220,36 @@ def _raw_layout_regions(
             text_regions.append(region)
         elif class_id == 2:
             bubbles.append(region)
+        elif class_id == 3:
+            panels.append(region)
 
-    return text_regions, bubbles
+    return text_regions, bubbles, panels
+
+
+def _assign_panel_index(
+    bbox: list[int],
+    panels: list[dict[str, Any]],
+) -> int | None:
+    candidates = [
+        (index, panel)
+        for index, panel in enumerate(panels)
+        if _center_inside(bbox, panel["bbox"])
+    ]
+    if not candidates:
+        return None
+    index, _ = min(candidates, key=lambda item: _area(item[1]["bbox"]))
+    return index
 
 
 def _group_regions_by_bubble(
     text_regions: list[dict[str, Any]],
     bubbles: list[dict[str, Any]],
-    reading_direction: str,
+    panels: list[dict[str, Any]],
+    panel_direction: str,
+    bubble_direction: str,
     row_tolerance: int,
+    vertical_priority: bool,
 ) -> list[dict[str, Any]]:
-    # A text region is assigned to the smallest detected bubble that contains
-    # its center. Choosing the smallest containing bubble avoids a large,
-    # overlapping bubble stealing text from a tighter match.
     assignments: dict[int, list[dict[str, Any]]] = {
         index: [] for index in range(len(bubbles))
     }
@@ -110,53 +261,94 @@ def _group_regions_by_bubble(
             for index, bubble in enumerate(bubbles)
             if _center_inside(text_region["bbox"], bubble["bbox"])
         ]
-
         if not candidates:
             standalone.append(text_region)
             continue
-
         bubble_index, _ = min(candidates, key=lambda item: _area(item[1]["bbox"]))
         assignments[bubble_index].append(text_region)
 
-    grouped: list[dict[str, Any]] = []
-
+    groups: list[dict[str, Any]] = []
     for bubble_index, bubble in enumerate(bubbles):
         members = assignments[bubble_index]
         if not members:
             continue
-
-        members = sort_regions_reading_order(
+        members = _sort_layout_regions(
             members,
-            direction=reading_direction,
+            direction=bubble_direction,
             row_tolerance=row_tolerance,
+            vertical_priority=vertical_priority,
         )
-        grouped.append(
+        groups.append(
             {
                 "group_type": "bubble",
                 "bbox": bubble["bbox"],
                 "bubble_bbox": bubble["bbox"],
                 "bubble_score": bubble["score"],
                 "text_regions": members,
+                "panel_index": _assign_panel_index(bubble["bbox"], panels),
             }
         )
 
     for text_region in standalone:
-        grouped.append(
+        groups.append(
             {
                 "group_type": "text",
                 "bbox": text_region["bbox"],
                 "bubble_bbox": None,
                 "bubble_score": None,
                 "text_regions": [text_region],
+                "panel_index": _assign_panel_index(text_region["bbox"], panels),
             }
         )
 
-    return sort_regions_reading_order(
-        grouped,
-        direction=reading_direction,
+    # First determine panel order. Then sort dialogue groups only inside each panel.
+    ordered_panels = _sort_layout_regions(
+        panels,
+        direction=panel_direction,
         row_tolerance=row_tolerance,
+        vertical_priority=vertical_priority,
     )
+    panel_rank = {id(panel): rank for rank, panel in enumerate(ordered_panels)}
+    original_panel_to_rank: dict[int, int] = {}
+    for original_index, panel in enumerate(panels):
+        original_panel_to_rank[original_index] = panel_rank.get(id(panel), len(ordered_panels))
 
+    buckets: dict[int | None, list[dict[str, Any]]] = {}
+    for group in groups:
+        buckets.setdefault(group["panel_index"], []).append(group)
+
+    ordered_groups: list[dict[str, Any]] = []
+    panel_indices = sorted(
+        [idx for idx in buckets if idx is not None],
+        key=lambda idx: original_panel_to_rank.get(idx, 10**9),
+    )
+    for panel_index in panel_indices:
+        ordered_groups.extend(
+            _sort_layout_regions(
+                buckets[panel_index],
+                direction=bubble_direction,
+                row_tolerance=row_tolerance,
+                vertical_priority=vertical_priority,
+            )
+        )
+
+    # Items not captured by any panel are kept as a fallback after panel groups.
+    if None in buckets:
+        ordered_groups.extend(
+            _sort_layout_regions(
+                buckets[None],
+                direction=bubble_direction,
+                row_tolerance=row_tolerance,
+                vertical_priority=vertical_priority,
+            )
+        )
+
+    return ordered_groups
+
+
+# -----------------------------------------------------------------------------
+# Bubble-aware, panel-aware pipeline
+# -----------------------------------------------------------------------------
 
 def process_pages(
     page_paths: list[Path],
@@ -181,6 +373,15 @@ def process_pages(
 
     records: list[dict[str, Any]] = []
     language_counter = Counter()
+    order_config = _resolved_order_config(reading_direction)
+
+    if debug:
+        print("[Reading order]")
+        print(f"  mode              : {order_config['mode']}")
+        print(f"  preset            : {order_config['preset']}")
+        print(f"  panel direction   : {order_config['panel_direction']}")
+        print(f"  bubble direction  : {order_config['bubble_direction']}")
+        print(f"  vertical priority : {order_config['vertical_priority']}")
 
     for page_number, page_path in enumerate(
         tqdm(page_paths, desc="페이지 처리"),
@@ -188,7 +389,7 @@ def process_pages(
     ):
         image = Image.open(page_path).convert("RGB")
 
-        text_regions, bubbles = _raw_layout_regions(
+        text_regions, bubbles, panels = _raw_layout_regions(
             detector=detector,
             image=image,
             class_thresholds=class_thresholds,
@@ -197,14 +398,18 @@ def process_pages(
         groups = _group_regions_by_bubble(
             text_regions=text_regions,
             bubbles=bubbles,
-            reading_direction=reading_direction,
+            panels=panels,
+            panel_direction=order_config["panel_direction"],
+            bubble_direction=order_config["bubble_direction"],
             row_tolerance=row_tolerance,
+            vertical_priority=order_config["vertical_priority"],
         )
 
         if debug:
             bubble_groups = sum(group["group_type"] == "bubble" for group in groups)
             standalone_groups = len(groups) - bubble_groups
             print(f"\n[Page {page_number:03d}] {page_path.name}")
+            print(f"  panels detected : {len(panels)}")
             print(f"  text regions    : {len(text_regions)}")
             print(f"  bubbles detected: {len(bubbles)}")
             print(f"  bubble records  : {bubble_groups}")
@@ -232,7 +437,6 @@ def process_pages(
                 piece = _normalize_dialogue(piece)
                 if not piece:
                     continue
-
                 pieces.append(piece)
                 text_bboxes.append(text_region["bbox"])
                 text_scores.append(round(text_region["score"], 4))
@@ -240,10 +444,8 @@ def process_pages(
             if not pieces:
                 continue
 
-            # One detected bubble becomes exactly one dialogue record.
             original_text = _normalize_dialogue(" ".join(pieces))
             page_ocr_count += 1
-
             language = detect_language(
                 text=original_text,
                 detector=language_detector,
@@ -281,6 +483,7 @@ def process_pages(
                     "order": group_index,
                     "bbox": group["bbox"],
                     "region_type": group["group_type"],
+                    "panel_index": group["panel_index"],
                     "bubble_bbox": group["bubble_bbox"],
                     "bubble_score": (
                         round(group["bubble_score"], 4)
@@ -295,6 +498,10 @@ def process_pages(
                         if is_bubble
                         else round(group["text_regions"][0]["score"], 4)
                     ),
+                    "reading_order_mode": order_config["mode"],
+                    "reading_order_preset": order_config["preset"],
+                    "panel_direction": order_config["panel_direction"],
+                    "bubble_direction": order_config["bubble_direction"],
                     "ocr_backend": ocr_backend,
                     "language": language,
                     "original": original_text,
@@ -310,5 +517,4 @@ def process_pages(
     print(f"  pages          : {len(page_paths)}")
     print(f"  output records : {len(records)}")
     print(f"  languages      : {dict(language_counter)}")
-
     return records
