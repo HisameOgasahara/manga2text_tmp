@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,15 @@ _OCR_CACHE: dict[tuple[str, str], Any] = {}
 
 
 def _ensure_comic_translate_import_path() -> Path:
+    """Expose only the pieces of comic-translate needed by Pororo OCR.
+
+    comic-translate's ``modules.utils`` package executes ``textblock`` from its
+    ``__init__.py``. That path eventually imports PySide6, which is a desktop UI
+    dependency and is irrelevant in Colab.  We therefore register
+    ``modules.utils`` as a lightweight namespace package that points at the same
+    directory without executing its ``__init__.py``.
+    """
+
     candidates: list[Path] = []
 
     env_path = os.environ.get("COMIC_TRANSLATE_PATH")
@@ -30,17 +40,35 @@ def _ensure_comic_translate_import_path() -> Path:
         ]
     )
 
+    root: Path | None = None
+
     for path in candidates:
         if path.exists():
-            path_str = str(path)
-            if path_str not in sys.path:
-                sys.path.insert(0, path_str)
-            return path
+            root = path
+            break
 
-    raise RuntimeError(
-        "comic-translate 저장소를 찾지 못했습니다. "
-        "Colab의 '저장소 가져오기' 셀을 먼저 실행하세요."
-    )
+    if root is None:
+        raise RuntimeError(
+            "comic-translate 저장소를 찾지 못했습니다. "
+            "Colab의 '저장소 가져오기' 셀을 먼저 실행하세요."
+        )
+
+    root_str = str(root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+
+    utils_path = root / "modules" / "utils"
+
+    # Avoid importing modules/utils/__init__.py because it imports textblock,
+    # which imports language_utils -> PySide6.  Pororo only needs individual
+    # utility modules such as torch_autocast.
+    if "modules.utils" not in sys.modules:
+        utils_package = types.ModuleType("modules.utils")
+        utils_package.__path__ = [str(utils_path)]
+        utils_package.__package__ = "modules.utils"
+        sys.modules["modules.utils"] = utils_package
+
+    return root
 
 
 def resolve_ocr_configuration(
@@ -82,11 +110,13 @@ def load_ocr_backend(
 ):
     if backend == "manga":
         cache_key = ("manga", "default")
+
         if cache_key not in _OCR_CACHE:
             from manga_ocr import MangaOcr
 
             print("[MangaOCR] loading Japanese OCR model")
             _OCR_CACHE[cache_key] = MangaOcr()
+
         return _OCR_CACHE[cache_key]
 
     if backend != "pororo":
@@ -94,9 +124,8 @@ def load_ocr_backend(
 
     _ensure_comic_translate_import_path()
 
-    # Import the Pororo core directly. Do not import PororoOCREngine because
-    # that wrapper imports PPOCR modules and therefore onnxruntime/Paddle-side
-    # dependencies that are unnecessary for Korean OCR here.
+    # Import the Pororo core directly.  Do not import PororoOCREngine because
+    # that wrapper pulls in PPOCR and desktop UI dependencies we do not use.
     from modules.ocr.pororo.main import PororoOcr
 
     requested_device = pororo_device or (
@@ -108,8 +137,10 @@ def load_ocr_backend(
         requested_device = "cpu"
 
     cache_key = ("pororo", requested_device)
+
     if cache_key not in _OCR_CACHE:
         print(f"[Pororo OCR] PyTorch BrainOCR device={requested_device}")
+
         _OCR_CACHE[cache_key] = PororoOcr(
             model="brainocr",
             lang="ko",
@@ -122,12 +153,15 @@ def load_ocr_backend(
 
 def run_pororo_ocr(model, crop: Image.Image) -> str:
     image_array = np.array(crop.convert("RGB"))
+
     model.run_ocr(image_array)
     result = model.get_ocr_result()
 
     texts: list[str] = []
+
     for text in result.get("description", []):
         text = str(text).strip()
+
         if text:
             texts.append(text)
 
@@ -157,6 +191,7 @@ def auto_detect_source_language(
     pororo_device: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Choose Korean vs Japanese using the OCR backends we actually use."""
+
     print("[Auto language] 한국어/일본어 두 후보만 비교합니다.")
 
     crops = _pipeline._base._sample_text_regions(
@@ -178,40 +213,48 @@ def auto_detect_source_language(
 
     for language, backend in candidates.items():
         print(f"[Auto language] testing {language} / {backend}")
+
         model = load_ocr_backend(
             backend=backend,
             pororo_device=pororo_device,
         )
 
         texts: list[str] = []
+
         for crop in crops:
             text = run_ocr(
                 backend=backend,
                 model=model,
                 crop=crop,
             ).strip()
+
             if text:
                 texts.append(text)
 
         joined = "\n".join(texts)
         score = _pipeline._base._script_score(joined, language)
+
         results[language] = {
             "backend": backend,
             "score": score,
             "sample": joined[:240],
         }
+
         print(f"  score={score:.3f} | sample={joined[:100]!r}")
 
     selected_language = max(
         results,
         key=lambda language: results[language]["score"],
     )
+
     print(f"[Auto language] selected: {selected_language}")
+
     return selected_language, results
 
 
 def install_pororo_overrides() -> None:
     """Patch package globals used by process_pages at runtime."""
+
     _pipeline.load_ocr_backend = load_ocr_backend
     _pipeline.run_ocr = run_ocr
     _pipeline.resolve_ocr_configuration = resolve_ocr_configuration
